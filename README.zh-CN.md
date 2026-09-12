@@ -4,8 +4,12 @@
 
 Pulse 是一个 macOS 菜单栏 app，一眼看到 Claude Code 和 Codex 的用量：今天用了多少 token，当前这 5 小时的额度还剩多少、烧得快不快，以及本周额度还剩多少。所有数据都是在本机解析你自己的会话文件得出的，不联网上报，也不需要注册账号。
 
-<!-- screenshot: docs/panel.png -->
-![Pulse 面板](docs/panel.png)
+<p align="center">
+  <img src="docs/panel-zh.png" width="300" alt="Pulse 面板（中文）">
+  &nbsp;&nbsp;
+  <img src="docs/panel.png" width="300" alt="Pulse panel (English)">
+</p>
+<p align="center"><sub>中文界面 · English UI</sub></p>
 
 ## 功能
 

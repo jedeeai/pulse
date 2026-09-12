@@ -4,8 +4,12 @@
 
 A macOS menu bar app that shows your Claude Code and Codex usage at a glance: today's token count, how fast you're burning through your current 5-hour window, and how much of your weekly quota is left. Everything is parsed locally from your own session files, no telemetry, no account required.
 
-<!-- screenshot: docs/panel.png -->
-![Pulse panel](docs/panel.png)
+<p align="center">
+  <img src="docs/panel.png" width="300" alt="Pulse panel (English)">
+  &nbsp;&nbsp;
+  <img src="docs/panel-zh.png" width="300" alt="Pulse 面板（中文）">
+</p>
+<p align="center"><sub>English UI · 中文界面</sub></p>
 
 ## Features
 
