@@ -1,0 +1,10 @@
+.build/
+dist/
+.DS_Store
+*.swiftpm
+.swiftpm/
+*.zip
+*.bak
+
+# 本地开发档案，不进公开仓库
+CLAUDE.md
