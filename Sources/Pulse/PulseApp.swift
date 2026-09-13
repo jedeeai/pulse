@@ -63,6 +63,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     private var statusItem: NSStatusItem!
     private var panel: NSPanel!
     private var hosting: NSHostingView<PulseMenuContent>!
+    private var scrollView: NSScrollView!
+    private var footerHosting: NSHostingView<PulseFooter>!
+    private var panelContainer: PanelBackgroundView!
     private let vm = UsageViewModel()
     private var cancellables = Set<AnyCancellable>()
     private let itemView = MenuBarItemView()
@@ -139,20 +142,38 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
 
     private func buildPanel() {
         hosting = NSHostingView(rootView: PulseMenuContent(vm: vm))
-        hosting.translatesAutoresizingMaskIntoConstraints = false
+        hosting.translatesAutoresizingMaskIntoConstraints = true
         hosting.wantsLayer = true
         hosting.layer?.backgroundColor = .clear
 
-        let container = NSView()
-        container.wantsLayer = true
-        container.layer?.backgroundColor = .clear
-        container.addSubview(hosting)
-        NSLayoutConstraint.activate([
-            hosting.leadingAnchor.constraint(equalTo: container.leadingAnchor),
-            hosting.trailingAnchor.constraint(equalTo: container.trailingAnchor),
-            hosting.topAnchor.constraint(equalTo: container.topAnchor),
-            hosting.bottomAnchor.constraint(equalTo: container.bottomAnchor),
-        ])
+        // 内容放进 NSScrollView：屏幕矮（如 1080p / 缩放模式）时面板高度钳到屏幕内，超出部分滚动查看
+        let document = FlippedDocumentView()
+        document.addSubview(hosting)
+        let scroll = NSScrollView()
+        scroll.documentView = document
+        scroll.drawsBackground = false
+        scroll.backgroundColor = .clear
+        scroll.hasVerticalScroller = true
+        scroll.hasHorizontalScroller = false
+        scroll.autohidesScrollers = true
+        scroll.scrollerStyle = .overlay
+        scroll.verticalScrollElasticity = .automatic
+        scroll.horizontalScrollElasticity = .none
+        scroll.autoresizingMask = []
+        scrollView = scroll
+
+        footerHosting = NSHostingView(rootView: PulseFooter(vm: vm))
+        footerHosting.translatesAutoresizingMaskIntoConstraints = true
+        footerHosting.wantsLayer = true
+        footerHosting.layer?.backgroundColor = .clear
+        footerHosting.autoresizingMask = []
+
+        let container = PanelBackgroundView(frame: .zero)
+        container.addSubview(scroll)
+        container.addSubview(footerHosting)
+        container.scrollArea = scroll
+        container.footer = footerHosting
+        panelContainer = container
 
         let panel = NSPanel(
             contentRect: NSRect(x: 0, y: 0, width: 280, height: 380),
@@ -187,9 +208,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         vm.panelVisible = true
         vm.refresh()
 
-        // 先按内容算好最终尺寸 + 定位
+        // 先按内容算好最终尺寸（高度钳到屏幕可用范围内，超出走滚动）+ 定位
         let size = hosting.fittingSize
-        if size.width > 0, size.height > 0 { panel.setContentSize(size) }
+        let footerH = footerHosting.fittingSize.height
+        if size.width > 0, size.height > 0 {
+            let maxH = maxPanelHeight()
+            let panelH = min(size.height + footerH, maxH)
+            hosting.frame = NSRect(x: 0, y: 0, width: size.width, height: size.height)
+            scrollView.documentView?.frame = hosting.frame
+            panelContainer.footerHeight = footerH
+            panel.setContentSize(NSSize(width: size.width, height: panelH))
+            panelContainer.needsLayout = true
+            panelContainer.layoutSubtreeIfNeeded()
+            scrollView.contentView.scroll(to: .zero)   // 文档视图已翻转，zero 即顶部；每次展开回到顶部
+            scrollView.reflectScrolledClipView(scrollView.contentView)
+        }
         positionPanel()
         let finalFrame = panel.frame
 
@@ -290,15 +323,87 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         let rectOnScreen = btnWindow.convertToScreen(rectInWindow)
         let w = panel.frame.width
         var x = rectOnScreen.midX - w / 2
-        let y = rectOnScreen.minY - panel.frame.height - 6
+        var y = rectOnScreen.minY - panel.frame.height - 6
         if let screen = btnWindow.screen {
             x = min(x, screen.visibleFrame.maxX - w - 8)
             x = max(x, screen.visibleFrame.minX + 8)
+            y = max(y, screen.visibleFrame.minY + 8)   // 兜底：不让面板伸出屏幕底边（Dock 以上）
         }
         panel.setFrameOrigin(NSPoint(x: x, y: y))
     }
 
+    /// 面板在当前屏幕能用的最大高度：状态栏按钮下沿 6pt 起，到 Dock/屏幕底边留 8pt
+    private func maxPanelHeight() -> CGFloat {
+        if ProcessInfo.processInfo.environment["PULSE_SHOW"] != nil, let screen = NSScreen.main {
+            return screen.visibleFrame.height - 16
+        }
+        guard let button = statusItem.button, let btnWindow = button.window, let screen = btnWindow.screen else {
+            return (NSScreen.main?.visibleFrame.height ?? 800) - 16
+        }
+        let rectOnScreen = btnWindow.convertToScreen(button.convert(button.bounds, to: nil))
+        return max(240, rectOnScreen.minY - 6 - (screen.visibleFrame.minY + 8))
+    }
+
     // 收回改用全局点击监听（见 installOutsideClickMonitor），不再依赖 resignKey
+}
+
+/// 面板底栏：刷新 / 退出，固定在面板底部不随卡片滚动
+struct PulseFooter: View {
+    @ObservedObject var vm: UsageViewModel
+    var body: some View {
+        HStack(spacing: 8) {
+            GlassButton(icon: "arrow.clockwise", label: L.t("Refresh", "刷新")) { vm.refresh() }
+            GlassButton(icon: "power", label: L.t("Quit", "退出")) { NSApplication.shared.terminate(nil) }
+        }
+        .padding(.top, 10)
+        .padding(.horizontal, 13)
+        .padding(.bottom, 13)
+        .frame(width: 280)
+    }
+}
+
+/// 面板背景容器：蓝色柔和渐变（实色，设计决定不用透明度）+ 22pt 连续圆角 + 细白描边
+final class PanelBackgroundView: NSView {
+    private let gradient = CAGradientLayer()
+    override init(frame: NSRect) {
+        super.init(frame: frame)
+        wantsLayer = true
+        layer?.cornerRadius = 22
+        layer?.cornerCurve = .continuous
+        layer?.masksToBounds = true
+        layer?.borderWidth = 0.6
+        layer?.borderColor = NSColor.white.withAlphaComponent(0.45).cgColor
+        gradient.colors = [
+            NSColor(red: 0.82, green: 0.90, blue: 0.97, alpha: 1).cgColor,
+            NSColor(red: 0.60, green: 0.78, blue: 0.96, alpha: 1).cgColor,
+            NSColor(red: 0.40, green: 0.63, blue: 0.93, alpha: 1).cgColor,
+        ]
+        gradient.startPoint = CGPoint(x: 0, y: 1)   // 左上（CALayer 原点在左下）
+        gradient.endPoint = CGPoint(x: 1, y: 0)     // 右下
+        layer?.insertSublayer(gradient, at: 0)
+    }
+    required init?(coder: NSCoder) { fatalError() }
+
+    /// 子视图不用 autoresizingMask（展开动画高度从 1 长到满，自动伸缩会算错），由 layout() 按当前 bounds 摆：
+    /// 底栏贴底固定高度，滚动区占其上全部
+    weak var scrollArea: NSView?
+    weak var footer: NSView?
+    var footerHeight: CGFloat = 0
+
+    override func layout() {
+        super.layout()
+        CATransaction.begin(); CATransaction.setDisableActions(true)
+        gradient.frame = bounds
+        CATransaction.commit()
+        let fh = min(footerHeight, bounds.height)
+        footer?.frame = NSRect(x: 0, y: 0, width: bounds.width, height: fh)
+        scrollArea?.frame = NSRect(x: 0, y: fh, width: bounds.width, height: max(0, bounds.height - fh))
+    }
+}
+
+/// 翻转坐标的滚动文档视图：origin 在左上，scroll(to: .zero) 即回顶
+final class FlippedDocumentView: NSView {
+    override var isFlipped: Bool { true }
 }
 
 struct PulseMenuContent: View {
@@ -308,42 +413,19 @@ struct PulseMenuContent: View {
     private let accent = Color(red: 0.11, green: 0.40, blue: 0.86)
     private let panelWidth: CGFloat = 280
 
-    // 蓝色柔和渐变（实色，设计决定不用透明度）
-    private var backgroundGradient: some View {
-        LinearGradient(
-            colors: [
-                Color(red: 0.82, green: 0.90, blue: 0.97),
-                Color(red: 0.60, green: 0.78, blue: 0.96),
-                Color(red: 0.40, green: 0.63, blue: 0.93)
-            ],
-            startPoint: .topLeading, endPoint: .bottomTrailing
-        )
-    }
-
+    // 渐变背景、圆角、描边由 AppKit 容器（PanelBackgroundView）绘制；这里只放可滚动的卡片区
     var body: some View {
-        ZStack {
-            backgroundGradient
-
-            VStack(spacing: 10) {
-                header
-                todayCard
-                sessionCard
-                planCard
-                trendCard
-                heatmapCard
-                HStack(spacing: 8) {
-                    GlassButton(icon: "arrow.clockwise", label: L.t("Refresh", "刷新")) { vm.refresh() }
-                    GlassButton(icon: "power", label: L.t("Quit", "退出")) { NSApplication.shared.terminate(nil) }
-                }
-            }
-            .padding(13)
+        VStack(spacing: 10) {
+            header
+            todayCard
+            sessionCard
+            planCard
+            trendCard
+            heatmapCard
         }
+        .padding(.top, 13)
+        .padding(.horizontal, 13)
         .frame(width: panelWidth)
-        .clipShape(RoundedRectangle(cornerRadius: 22, style: .continuous))
-        .overlay(
-            RoundedRectangle(cornerRadius: 22, style: .continuous)
-                .stroke(.white.opacity(0.45), lineWidth: 0.6)
-        )
     }
 
     private var header: some View {
