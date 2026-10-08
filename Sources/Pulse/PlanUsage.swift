@@ -17,6 +17,14 @@ struct PlanUsage {
     let limits: [PlanLimitInfo]
     let fetchedAt: Date
     let source: QuotaSource
+    let organizationUuid: String?   // 顺手带出的组织编号，Codex 来源恒 nil，Claude 账号切换缓存靠它
+
+    init(limits: [PlanLimitInfo], fetchedAt: Date, source: QuotaSource, organizationUuid: String? = nil) {
+        self.limits = limits
+        self.fetchedAt = fetchedAt
+        self.source = source
+        self.organizationUuid = organizationUuid
+    }
 
     /// 周总额度剩余百分比（菜单栏用）
     var weeklyRemainingPercent: Int? {
@@ -75,9 +83,9 @@ struct PlanUsage {
 enum ClaudeQuotaFetcher {
 
     static func fetch() -> PlanUsage? {
-        guard let token = readAccessToken() else { return nil }
+        guard let (token, org) = readCredentials() else { return nil }
         for mode in [ProxyMode.system, .none] {
-            let (r, status) = request(token: token, proxy: mode)
+            let (r, status) = request(token: token, org: org, proxy: mode)
             if let r = r { return r }
             // 429/401/403 是账号级错误，换代理也没用，别再叠加请求（usage 接口限流很敏感）
             if let st = status, st == 429 || st == 401 || st == 403 { return nil }
@@ -87,21 +95,40 @@ enum ClaudeQuotaFetcher {
 
     // MARK: - 凭证
 
-    /// Claude Code 把 OAuth 凭证存在钥匙串「Claude Code-credentials」；fallback 到 ~/.claude/.credentials.json
-    private static func readAccessToken() -> String? {
-        if let json = keychainCredentials(), let t = parseAccessToken(json) { return t }
+    /// Claude Code 把 OAuth 凭证存在钥匙串「Claude Code-credentials」；fallback 到 ~/.claude/.credentials.json。
+    /// 顺手把同一份 JSON 里的 organizationUuid 取出来（账号切换用），不额外起进程。
+    private static func readCredentials() -> (token: String, org: String?)? {
+        // 同一个服务名下可能有多条（账户名不同），不带账户名时 security 只返回第一条，
+        // 可能正好是只有 mcpOAuth、没有登录凭证的那条。Claude Code 写入时账户名用系统用户名，
+        // 所以先按用户名精确取，取不到再不限账户兜底。
+        for account in [NSUserName(), nil] as [String?] {
+            if let json = keychainCredentials(account: account), let t = parseAccessToken(json) {
+                return (t, parseOrgUuid(json))
+            }
+        }
         let path = FileManager.default.homeDirectoryForCurrentUser
             .appendingPathComponent(".claude/.credentials.json")
         if let data = try? Data(contentsOf: path),
            let s = String(data: data, encoding: .utf8),
-           let t = parseAccessToken(s) { return t }
+           let t = parseAccessToken(s) {
+            return (t, parseOrgUuid(s))
+        }
         return nil
     }
 
-    private static func keychainCredentials() -> String? {
+    private static func parseOrgUuid(_ json: String) -> String? {
+        guard let data = json.data(using: .utf8),
+              let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
+        else { return nil }
+        return obj["organizationUuid"] as? String
+    }
+
+    private static func keychainCredentials(account: String?) -> String? {
         let task = Process()
         task.launchPath = "/usr/bin/security"
-        task.arguments = ["find-generic-password", "-s", "Claude Code-credentials", "-w"]
+        var args = ["find-generic-password", "-s", "Claude Code-credentials"]
+        if let account = account, !account.isEmpty { args += ["-a", account] }
+        task.arguments = args + ["-w"]
         let pipe = Pipe()
         task.standardOutput = pipe
         task.standardError = Pipe()
@@ -126,7 +153,7 @@ enum ClaudeQuotaFetcher {
     // MARK: - 请求
 
     /// 返回 (结果, HTTP 状态码)；网络不通时状态码为 nil
-    private static func request(token: String, proxy: ProxyMode) -> (PlanUsage?, Int?) {
+    private static func request(token: String, org: String?, proxy: ProxyMode) -> (PlanUsage?, Int?) {
         let (data, status) = syncGET(
             urlString: "https://api.anthropic.com/api/oauth/usage",
             headers: [
@@ -137,10 +164,10 @@ enum ClaudeQuotaFetcher {
             proxy: proxy
         )
         guard let data = data else { return (nil, status) }
-        return (parse(data), status)
+        return (parse(data, org: org), status)
     }
 
-    private static func parse(_ data: Data) -> PlanUsage? {
+    private static func parse(_ data: Data, org: String?) -> PlanUsage? {
         guard let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
               let limits = obj["limits"] as? [[String: Any]]
         else { return nil }
@@ -170,6 +197,10 @@ enum ClaudeQuotaFetcher {
             var resets: Date? = nil
             if let s = item["resets_at"] as? String {
                 resets = iso.date(from: s) ?? isoPlain.date(from: s)
+                // 接口给的时刻常差零点几秒（13:59:59.9），不取整会显示成 13:59
+                if let r = resets {
+                    resets = Date(timeIntervalSince1970: (r.timeIntervalSince1970 / 60).rounded() * 60)
+                }
             }
             infos.append(PlanLimitInfo(id: kind, label: label,
                                        percentUsed: min(max(percent, 0), 100),
@@ -179,7 +210,7 @@ enum ClaudeQuotaFetcher {
         // 固定顺序：5小时 → 周全部 → 周Opus
         let order = ["session": 0, "weekly_all": 1, "weekly_scoped": 2]
         infos.sort { (order[$0.id] ?? 9) < (order[$1.id] ?? 9) }
-        return PlanUsage(limits: infos, fetchedAt: Date(), source: .claude)
+        return PlanUsage(limits: infos, fetchedAt: Date(), source: .claude, organizationUuid: org)
     }
 }
 

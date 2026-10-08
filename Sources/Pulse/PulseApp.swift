@@ -207,6 +207,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         isShown = true
         vm.panelVisible = true
         vm.refresh()
+        vm.refreshAccounts()
 
         // 先按内容算好最终尺寸（高度钳到屏幕可用范围内，超出走滚动）+ 定位
         let size = hosting.fittingSize
@@ -419,6 +420,7 @@ struct PulseMenuContent: View {
             header
             todayCard
             sessionCard
+            accountCard
             planCard
             trendCard
             heatmapCard
@@ -619,6 +621,184 @@ struct PulseMenuContent: View {
             .padding(.horizontal, 6)
             .frame(height: 16)
             .background(color.opacity(0.14), in: Capsule())
+    }
+
+    /// Claude 账号切换卡：cswitch 不存在时整张不显示。每行左圆点(●在用/○不在用)，
+    /// 在用行底色比其他行深一档（明度区分，不靠色相），非在用行给「切到这个号」蓝色按钮。
+    @ViewBuilder
+    private var accountCard: some View {
+        if AccountSwitch.isAvailable {
+            VStack(alignment: .leading, spacing: 7) {
+                cardTitle(L.t("CLAUDE ACCOUNT", "CLAUDE 账号"))
+                if vm.accounts.isEmpty {
+                    Text(L.t("Loading…", "获取中…"))
+                        .font(.system(size: 11, weight: .medium))
+                        .foregroundStyle(.secondary)
+                } else {
+                    VStack(spacing: 6) {
+                        ForEach(vm.accounts) { acct in
+                            accountRow(acct)
+                        }
+                    }
+                    if vm.accounts.count < 2 {
+                        Text(L.t("Log into a second account, then run \"cswitch save\" in Terminal",
+                                  "登录第二个号后在终端跑 cswitch save"))
+                            .font(.system(size: 9, weight: .medium))
+                            .foregroundStyle(.secondary.opacity(0.8))
+                    }
+                    if let msg = vm.switchMessage {
+                        HStack(alignment: .top, spacing: 5) {
+                            Image(systemName: vm.switchMessageIsError ? "exclamationmark.triangle.fill" : "checkmark.circle.fill")
+                                .font(.system(size: 10, weight: .semibold))
+                            Text(msg)
+                                .font(.system(size: 10, weight: .medium))
+                                .lineLimit(2)
+                        }
+                        .foregroundStyle(vm.switchMessageIsError ? warnOrange : accent)
+                    }
+                }
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .modifier(GlassCard())
+        }
+    }
+
+    private var warnOrange: Color { Color(red: 0.92, green: 0.53, blue: 0.10) }
+
+    /// 单个账号行：左圆点(实心=在用/空心=不在用)，中间邮箱+额度小字，右侧「在用」标签或切换按钮；
+    /// 下面通栏一行周额度重置时间（左：哪天几点重置，右：还有多久）
+    private func accountRow(_ acct: CSwitchAccount) -> some View {
+        VStack(alignment: .leading, spacing: 5) {
+            accountRowTop(acct)
+            weeklyResetLine(for: acct)
+                .padding(.leading, 16)   // 8 圆点 + 8 间距，和邮箱左边对齐
+        }
+        .padding(.horizontal, 8)
+        .padding(.vertical, 7)
+        .frame(maxWidth: .infinity)
+        .background(acct.active ? accent.opacity(0.12) : Color.white.opacity(0.55),
+                    in: RoundedRectangle(cornerRadius: 10, style: .continuous))
+    }
+
+    private func accountRowTop(_ acct: CSwitchAccount) -> some View {
+        HStack(spacing: 8) {
+            Image(systemName: acct.active ? "circle.fill" : "circle")
+                .font(.system(size: 8, weight: .semibold))
+                .foregroundStyle(acct.active ? accent : Color.secondary.opacity(0.55))
+            VStack(alignment: .leading, spacing: 2) {
+                Text(acct.email)
+                    .font(.system(size: 11, weight: .semibold))
+                    .foregroundStyle(.primary)
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+                Text(quotaLine(for: acct))
+                    .font(.system(size: 9, weight: .medium))
+                    .foregroundStyle(.secondary.opacity(0.85))
+                    .lineLimit(1)
+            }
+            Spacer(minLength: 6)
+            if acct.active {
+                Text(L.t("In use", "在用"))
+                    .font(.system(size: 9, weight: .bold))
+                    .foregroundStyle(accent)
+                    .padding(.horizontal, 7)
+                    .frame(height: 17)
+                    .background(accent.opacity(0.18), in: Capsule())
+            } else {
+                switchButton(acct)
+            }
+        }
+    }
+
+    /// 周额度重置行。三种状态：还没到点（时间＋倒计时）/ 已过点（不在用的号缓存的时刻过期了，
+    /// 说明周额度已经刷新）/ 没记录。24 小时内重置的倒计时加粗变主色，靠粗细也能看出来。
+    private func weeklyResetLine(for acct: CSwitchAccount) -> some View {
+        let resetsAt = AccountSwitch.cachedQuota(for: acct.org)?.weeklyResetsAt
+        let now = Date()
+        let left: String
+        var right: String? = nil
+        var soon = false
+        if let r = resetsAt {
+            let day = Self.resetDayStr(r)
+            if r > now {
+                left = L.t("Weekly resets \(day)", "周额度 \(day) 重置")
+                right = Self.untilStr(r.timeIntervalSince(now))
+                soon = r.timeIntervalSince(now) < 24 * 3600
+            } else {
+                left = L.t("Weekly quota reset (\(day))", "周额度已重置（\(day)）")
+            }
+        } else {
+            left = L.t("Weekly reset time not recorded", "周重置时间还没记录")
+        }
+        return HStack(spacing: 4) {
+            Image(systemName: "arrow.triangle.2.circlepath")
+                .font(.system(size: 8, weight: .semibold))
+            Text(left)
+                .font(.system(size: 9, weight: .medium))
+                .lineLimit(1)
+            Spacer(minLength: 4)
+            if let right = right {
+                Text(right)
+                    .font(.system(size: 9, weight: soon ? .bold : .medium))
+                    .monospacedDigit()
+                    .foregroundStyle(soon ? accent : Color.secondary.opacity(0.85))
+                    .lineLimit(1)
+                    .fixedSize()
+            }
+        }
+        .foregroundStyle(.secondary.opacity(0.85))
+    }
+
+    /// 重置是哪天几点：今天/明天直说，其余「周X HH:mm」
+    static func resetDayStr(_ d: Date) -> String {
+        let cal = Calendar.current
+        let time = timeStr(d)
+        if cal.isDateInToday(d) { return L.t("today \(time)", "今天 \(time)") }
+        if cal.isDateInTomorrow(d) { return L.t("tomorrow \(time)", "明天 \(time)") }
+        let f = DateFormatter()
+        f.locale = Locale(identifier: L.isZh ? "zh_CN" : "en_US")
+        f.dateFormat = "EEE HH:mm"
+        return f.string(from: d)
+    }
+
+    /// 还有多久：≥1 天「2 天 3 小时后」（整天「2 天后」），<1 天「3 小时 20 分后」，<1 小时「20 分钟后」
+    static func untilStr(_ t: TimeInterval) -> String {
+        let mins = max(1, Int(t / 60))
+        let d = mins / 1440, h = (mins % 1440) / 60, m = mins % 60
+        if d > 0, h == 0 { return L.t("in \(d)d", "\(d) 天后") }
+        if d > 0 { return L.t("in \(d)d \(h)h", "\(d) 天 \(h) 小时后") }
+        if h > 0 { return L.t("in \(h)h \(m)m", "\(h) 小时 \(m) 分后") }
+        return L.t("in \(m)m", "\(m) 分钟后")
+    }
+
+    private func switchButton(_ acct: CSwitchAccount) -> some View {
+        let isSwitchingThis = vm.switchingEmail == acct.email
+        let anySwitching = vm.switchingEmail != nil
+        return Button(action: { vm.switchAccount(to: acct.email) }) {
+            Text(isSwitchingThis ? L.t("Switching…", "切换中…") : L.t("Switch", "切到这个号"))
+                .font(.system(size: 10, weight: .semibold))
+                .foregroundStyle(.white)
+                .lineLimit(1)
+                .fixedSize()
+                .padding(.horizontal, 8)
+                .frame(height: 20)
+                .background(anySwitching ? accent.opacity(0.45) : accent, in: Capsule())
+        }
+        .buttonStyle(.plain)
+        .disabled(anySwitching)
+    }
+
+    /// 额度小字：在用账号显示实时的「周剩%·5小时剩%」，其余账号显示上次看到的缓存值
+    private func quotaLine(for acct: CSwitchAccount) -> String {
+        guard let c = AccountSwitch.cachedQuota(for: acct.org) else {
+            return L.t("No quota record yet", "还没有额度记录")
+        }
+        if acct.active {
+            return L.t("Weekly \(c.weeklyRemain)% · 5h \(c.sessionRemain)% left",
+                        "周剩 \(c.weeklyRemain)% · 5 小时剩 \(c.sessionRemain)%")
+        }
+        return L.t("Last seen: weekly \(c.weeklyRemain)% (\(Self.timeStr(c.fetchedAt)))",
+                    "上次剩 周 \(c.weeklyRemain)%（\(Self.timeStr(c.fetchedAt))）")
     }
 
     /// 套餐额度卡：标题随来源变（CLAUDE PLAN / CODEX PLAN），右上角来源切换胶囊；

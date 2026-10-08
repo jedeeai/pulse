@@ -15,6 +15,12 @@ final class UsageViewModel: ObservableObject {
     @Published var quotaSource: QuotaSource = .claude   // 额度来源，UserDefaults 持久化
     @Published var planUnavailable = false  // 当前来源拉取/读取失败或本地无数据
 
+    @Published var accounts: [CSwitchAccount] = []       // cswitch 账号列表（cswitch 不存在则恒空）
+    @Published var activeOrg: String? = nil              // 当前在用账号的组织编号
+    @Published var switchingEmail: String? = nil         // 正在切换到的邮箱，nil=没有切换在进行
+    @Published var switchMessage: String? = nil          // 切换结果提示（成功/失败都用这条），8 秒后自动清
+    @Published var switchMessageIsError = false
+
     private let historyDays = 200
     private var watcher: FileWatcher?
     private let scanQueue = DispatchQueue(label: "com.jedee.pulse.scan", qos: .utility)
@@ -39,8 +45,10 @@ final class UsageViewModel: ObservableObject {
         }
         // 套餐额度：启动拉一次，之后每 5 分钟一次
         fetchPlan()
+        refreshAccounts()
         planTimer = Timer.scheduledTimer(withTimeInterval: 300, repeats: true) { [weak self] _ in
             self?.fetchPlan()
+            self?.refreshAccounts()
         }
     }
 
@@ -69,6 +77,8 @@ final class UsageViewModel: ObservableObject {
                 guard let self = self else { return }
                 self.isFetchingPlan = false
                 if let r = r {
+                    // 每账号额度缓存：不管当前展示的是不是这个来源，拿到 Claude 额度就记一笔
+                    if r.source == .claude { AccountSwitch.recordQuota(r) }
                     // 结果的来源要和当前选中的来源一致才赋值：防止切换瞬间旧请求回来覆盖新来源
                     guard r.source == self.quotaSource else { return }
                     self.plan = r
@@ -76,6 +86,47 @@ final class UsageViewModel: ObservableObject {
                 } else if source == self.quotaSource {
                     self.planUnavailable = true
                 }
+            }
+        }
+    }
+
+    /// 刷新账号列表 + 当前在用的号（只读，不切换）。cswitch 不存在时 accounts 恒空。
+    func refreshAccounts() {
+        AccountSwitch.fetchStatus { [weak self] status in
+            guard let self = self, let status = status else { return }
+            self.accounts = status.accounts
+            self.activeOrg = status.active
+        }
+    }
+
+    /// 切到指定邮箱的号。同一时刻只允许一个切换在进行（UI 按钮也据此整体禁用）。
+    func switchAccount(to email: String) {
+        guard switchingEmail == nil else { return }
+        switchingEmail = email
+        AccountSwitch.switchTo(email: email) { [weak self] result in
+            guard let self = self else { return }
+            self.switchingEmail = nil
+            switch result {
+            case .success(let status):
+                self.accounts = status.accounts
+                self.activeOrg = status.active
+                self.switchMessageIsError = false
+                self.switchMessage = L.t("Switched to \(email) — new chats use it",
+                                          "已切到 \(email)，新开对话生效")
+                // 旧账号的套餐额度已经不属于新账号了：清掉走「获取中」，并按现有防重入逻辑重新拉一次
+                if self.quotaSource == .claude {
+                    self.plan = nil
+                    self.planUnavailable = false
+                    self.fetchPlan()
+                }
+            case .failure(let err):
+                self.switchMessageIsError = true
+                self.switchMessage = err.message
+            }
+            let shown = self.switchMessage
+            DispatchQueue.main.asyncAfter(deadline: .now() + 8) { [weak self] in
+                guard let self = self, self.switchMessage == shown else { return }
+                self.switchMessage = nil
             }
         }
     }

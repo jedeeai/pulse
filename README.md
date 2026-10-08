@@ -25,6 +25,7 @@ A macOS menu bar app that shows your Claude Code and Codex usage at a glance: to
 - **Event-driven, not polling** — after an initial one-time scan, an FSEvents watcher picks up new sessions incrementally. CPU usage is 0% while idle.
 - **Follows your system language** — Chinese system shows Chinese labels and 亿/万 units; anything else shows English and B/M/K units.
 - **Colorblind-safe** — status is never conveyed by red vs. green alone; every state has a text label, and the only accent colors used are blue and orange.
+- **Optional: switch between Claude accounts** — if you use more than one Claude account, install the bundled `cswitch` helper and an extra card lists your accounts, each one's last-seen quota and weekly reset time, with a one-click switch. See [Multiple Claude accounts](#multiple-claude-accounts-optional).
 - Single-instance (a second launch quits immediately), quit from the "Quit" button at the bottom of the panel.
 
 ## Install
@@ -63,10 +64,35 @@ Only tools you actually have installed and have used will show data.
 
 Scanning is event-driven: Pulse does one full scan on launch (which can take up to a minute or so on very large histories, shown as `…` in the menu bar), then listens for filesystem changes and only re-parses what changed. Claude quota is polled every 5 minutes; the 5-hour window auto-refreshes when it resets.
 
+## Multiple Claude accounts (optional)
+
+If you have more than one Claude account (say, a personal and a work subscription), Pulse can switch Claude Code between them. This is off by default: the card only appears once the `cswitch` helper is installed.
+
+```bash
+# from the repo root
+mkdir -p ~/.local/bin
+cp scripts/cswitch ~/.local/bin/cswitch
+chmod +x ~/.local/bin/cswitch
+```
+
+Then save each account once:
+
+1. In Claude Code, `/login` with your first account, then run `cswitch save` in Terminal.
+2. `/login` with your second account, then run `cswitch save` again.
+
+Reopen the Pulse panel and a **CLAUDE ACCOUNT** card shows up above the plan card. For each account it shows weekly and 5-hour quota left (the account you're not using shows the last value Pulse saw, with the time), when its weekly quota resets, and a **Switch** button. After switching, *new* Claude Code sessions use the new account; sessions that are already open keep the old one.
+
+You can also use it from Terminal: `cswitch` (switch to the next account), `cswitch use you@example.com`, `cswitch status`.
+
+How it works: Claude Code keeps its login in the Keychain item `Claude Code-credentials`. `cswitch` stores a copy of each account's login in separate Keychain items named `cswitch-account`, and on switch swaps the target account's login into `Claude Code-credentials` and updates `oauthAccount` in `~/.claude.json`. Your memory, settings, skills and history in `~/.claude` are shared by all accounts. MCP server logins stored in the same Keychain item are left untouched. Requires `python3` (comes with the Xcode Command Line Tools).
+
+To uninstall, delete `~/.local/bin/cswitch` (the card disappears), and optionally remove the saved logins in Keychain Access by searching for `cswitch-account`.
+
 ## Privacy
 
 - **Reads**: your local `~/.claude` and `~/.codex` session files (never modified), and the Claude Code OAuth `accessToken` from your Keychain.
-- **Never reads or touches**: your Claude Code `refreshToken` — Pulse only ever reads the short-lived `accessToken` and never writes to the Keychain or your credential files.
+- **Never reads or touches**: your Claude Code `refreshToken` — Pulse itself only ever reads the short-lived `accessToken` and never writes to the Keychain or your credential files.
+- **Exception, only if you install `cswitch`**: switching accounts does write to the Keychain and `~/.claude.json`, because that's what switching means. `cswitch` stores each account's full login (including its `refreshToken`) in your local Keychain and never sends it anywhere. Without `cswitch` installed, none of this happens.
 - **Sends**: exactly one kind of network request — to Anthropic's own usage endpoint, using your own already-issued token, to read your remaining quota. That's it.
 - **Never sends**: source code, prompts, conversation content, file contents, or any analytics/telemetry. Pulse has no backend of its own.
 - **Fully offline mode**: switch the plan quota card to Codex and Pulse makes zero network requests, since Codex quota is read from local files only.
@@ -101,6 +127,7 @@ The codebase is small and split by concern:
 - `Sources/Pulse/UsageScanner.swift` — parses local session files into token counts.
 - `Sources/Pulse/PlanUsage.swift` + `Sources/Pulse/CodexQuota.swift` — quota fetching/adapters for Claude and Codex respectively.
 - `Sources/Pulse/PulseApp.swift` — menu bar item and panel UI.
+- `Sources/Pulse/AccountSwitch.swift` + `scripts/cswitch` — optional Claude account switching.
 - `Sources/Pulse/L10n.swift` — user-facing strings and number formatting.
 
 To add support for another tool, write an adapter that follows the Codex one (a local-file reader, no login flow) or the Claude one (an OAuth-token reuse reader), then wire it into the scanner and the panel's tool switcher.

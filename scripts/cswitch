@@ -1,0 +1,219 @@
+#!/usr/bin/env python3
+"""cswitch: switch between multiple Claude Code accounts on one Mac.
+cswitch：Claude Code 多账号切换（本机钥匙串对调登录凭证，记忆/设置/skills 全共用）
+
+Usage / 用法:
+  cswitch            switch to the next account / 切到下一个号（两个号时就是来回切）
+  cswitch use EMAIL  switch to that account / 切到指定邮箱的号
+  cswitch save       remember the account you're logged into now (run once after each /login)
+                     把当前在用的号存一份（新 /login 一个号后跑一次）
+  cswitch status     list saved accounts and which one is active (--json for Pulse)
+                     看有哪些号、当前是哪个（--json 给 Pulse 用）
+
+How it works / 原理:
+  Claude Code keeps its login in the Keychain item "Claude Code-credentials".
+  Each saved account gets its own copy in Keychain items named "cswitch-account"
+  (one per organization). Before switching, the active account's latest token is
+  saved back (tokens rotate, old copies go stale), then the target's is swapped in.
+  mcpOAuth (MCP server logins) in the same item is never touched.
+  Claude Code 的登录凭证在钥匙串「Claude Code-credentials」里。每个号的凭证另存在
+  钥匙串「cswitch-account」（按组织编号区分）。切号前先把在用的号的最新凭证存回去
+  （凭证会自动续期，旧备份会失效），再换上目标号。同一条目里的 mcpOAuth 始终保留。
+
+Messages follow CSWITCH_LANG (zh/en) if set, otherwise the macOS system language.
+"""
+import fcntl, getpass, json, os, subprocess, sys, tempfile
+
+LIVE_SVC = "Claude Code-credentials"
+SLOT_SVC = "cswitch-account"
+USER = getpass.getuser()
+CLAUDE_JSON = os.path.expanduser("~/.claude.json")
+LOCK = os.path.expanduser("~/.claude/.cswitch.lock")
+SEC = "/usr/bin/security"
+
+
+def _is_zh():
+    lang = os.environ.get("CSWITCH_LANG", "").lower()
+    if lang:
+        return lang.startswith("zh")
+    try:
+        out = subprocess.run(["/usr/bin/defaults", "read", "-g", "AppleLanguages"],
+                             capture_output=True, text=True, timeout=2).stdout
+        first = next((l.strip().strip('",') for l in out.splitlines() if l.strip() not in ("(", ")")), "")
+        return first.lower().startswith("zh")
+    except Exception:
+        return os.environ.get("LANG", "").lower().startswith("zh")
+
+
+ZH = _is_zh()
+
+
+def t(en, zh):
+    return zh if ZH else en
+
+
+def sec(*args, check=True):
+    p = subprocess.run([SEC, *args], capture_output=True, text=True)
+    if check and p.returncode != 0:
+        raise RuntimeError(t(f"security {args[0]} failed: {p.stderr.strip()}",
+                             f"security {args[0]} 失败：{p.stderr.strip()}"))
+    return p
+
+
+def read_live():
+    p = sec("find-generic-password", "-a", USER, "-s", LIVE_SVC, "-w", check=False)
+    if p.returncode != 0:
+        return None
+    return json.loads(p.stdout.strip())
+
+
+def write_live(d):
+    sec("add-generic-password", "-U", "-a", USER, "-s", LIVE_SVC, "-w", json.dumps(d, separators=(",", ":")))
+
+
+def list_slots():
+    """钥匙串里所有 cswitch-account 条目 → {org: slot}"""
+    out = subprocess.run([SEC, "dump-keychain"], capture_output=True, text=True).stdout
+    orgs, cur_acct = [], None
+    for line in out.splitlines():
+        line = line.strip()
+        if line.startswith('"acct"<blob>='):
+            cur_acct = line.split("=", 1)[1].strip('"')
+        elif line == f'"svce"<blob>="{SLOT_SVC}"' and cur_acct:
+            orgs.append(cur_acct)
+    slots = {}
+    for org in dict.fromkeys(orgs):
+        p = sec("find-generic-password", "-a", org, "-s", SLOT_SVC, "-w", check=False)
+        if p.returncode == 0:
+            slots[org] = json.loads(p.stdout.strip())
+    return slots
+
+
+def write_slot(org, slot):
+    sec("add-generic-password", "-U", "-a", org, "-s", SLOT_SVC,
+        "-l", f"cswitch {slot.get('email', org)}", "-w", json.dumps(slot, separators=(",", ":")))
+
+
+def read_claude_json():
+    with open(CLAUDE_JSON) as f:
+        return json.load(f)
+
+
+def write_oauth_account(acct):
+    d = read_claude_json()
+    d["oauthAccount"] = acct
+    fd, tmp = tempfile.mkstemp(dir=os.path.dirname(CLAUDE_JSON), prefix=".claude.json.cswitch")
+    with os.fdopen(fd, "w") as f:
+        json.dump(d, f, indent=2, ensure_ascii=False)
+    os.chmod(tmp, 0o600)
+    os.replace(tmp, CLAUDE_JSON)
+
+
+def sync(slots):
+    """把在用的号的最新凭证存回它的槽位；槽位不存在时用 ~/.claude.json 的账号信息新建。返回在用的 org。"""
+    live = read_live()
+    if not live or "claudeAiOauth" not in live:
+        return None
+    org = live.get("organizationUuid")
+    if not org:
+        # /login 写入的凭证不带组织编号：先按 refreshToken 对槽位，对不上就以 ~/.claude.json 为准
+        rt = live["claudeAiOauth"].get("refreshToken")
+        org = next((o for o, s in slots.items() if s.get("claudeAiOauth", {}).get("refreshToken") == rt), None)
+        if not org:
+            org = (read_claude_json().get("oauthAccount") or {}).get("organizationUuid")
+        if not org:
+            return None
+        live["organizationUuid"] = org
+        write_live(live)
+    slot = slots.get(org)
+    if slot is None:
+        acct = read_claude_json().get("oauthAccount") or {}
+        if acct.get("organizationUuid") != org:
+            return org  # 账号信息对不上（刚登录还没写完），先不建
+        slot = {"email": acct.get("emailAddress", org), "oauthAccount": acct}
+    if slot.get("claudeAiOauth") != live["claudeAiOauth"] or "email" not in slot:
+        slot["claudeAiOauth"] = live["claudeAiOauth"]
+        slot["organizationUuid"] = org
+        # ~/.claude.json 的账号信息若就是这个号，顺手更新（套餐变化等）
+        acct = read_claude_json().get("oauthAccount") or {}
+        if acct.get("organizationUuid") == org:
+            slot["oauthAccount"] = acct
+            slot["email"] = acct.get("emailAddress", slot.get("email", org))
+        write_slot(org, slot)
+    slots[org] = slot
+    return org
+
+
+def use(slots, target_org):
+    live = read_live() or {}
+    slot = slots[target_org]
+    live["claudeAiOauth"] = slot["claudeAiOauth"]
+    live["organizationUuid"] = target_org
+    write_live(live)  # mcpOAuth 等其他字段原样保留
+    if slot.get("oauthAccount"):
+        write_oauth_account(slot["oauthAccount"])
+
+
+def status_obj(slots, active):
+    accts = []
+    for org, s in slots.items():
+        o = s.get("claudeAiOauth", {})
+        accts.append({"email": s.get("email", org), "org": org, "active": org == active,
+                      "plan": o.get("subscriptionType", "")})
+    accts.sort(key=lambda a: a["email"])
+    return {"active": active, "accounts": accts}
+
+
+def main():
+    args = sys.argv[1:]
+    cmd = args[0] if args else "next"
+    as_json = "--json" in args
+    os.makedirs(os.path.dirname(LOCK), exist_ok=True)
+    with open(LOCK, "w") as lk:
+        fcntl.flock(lk, fcntl.LOCK_EX)
+        slots = list_slots()
+        active = sync(slots)
+
+        if cmd in ("next", "use"):
+            orgs = sorted(slots, key=lambda o: slots[o].get("email", o))
+            if cmd == "use":
+                if len(args) < 2:
+                    sys.exit(t("Usage: cswitch use EMAIL", "用法：cswitch use 邮箱"))
+                hits = [o for o in orgs if slots[o].get("email") == args[1] or o == args[1]]
+                if not hits:
+                    sys.exit(t(f"No saved account: {args[1]} (log into it, then run cswitch save)",
+                               f"没有这个号：{args[1]}（先登录它再跑 cswitch save）"))
+                target = hits[0]
+            else:
+                if len(orgs) < 2:
+                    sys.exit(t("Only one account saved. /login another account in Claude Code, then run cswitch save",
+                               "只存了一个号。先在 Claude Code 里 /login 另一个号，再跑 cswitch save"))
+                i = orgs.index(active) if active in orgs else -1
+                target = orgs[(i + 1) % len(orgs)]
+            if target != active:
+                use(slots, target)
+                active = target
+            email = slots[target].get("email")
+            msg = t(f"Switched to {email}. New Claude Code sessions will use it.",
+                    f"已切到 {email}，新开的对话会用这个号")
+        elif cmd in ("save", "status"):
+            msg = None
+        else:
+            sys.exit(__doc__)
+
+        st = status_obj(slots, active)
+        if as_json:
+            print(json.dumps(st, ensure_ascii=False))
+            return
+        if msg:
+            print(msg)
+        for a in st["accounts"]:
+            mark = t("▶ active ", "▶ 在用  ") if a["active"] else t(" " * 9, " " * 7)
+            print(mark + f"{a['email']}  ({a['plan']})")
+        if active and active not in slots:
+            print(t("The account you're logged into isn't saved yet. Wait a few seconds and run cswitch save again.",
+                    "当前登录的号还没存上，稍等几秒再跑 cswitch save"))
+
+
+if __name__ == "__main__":
+    main()
