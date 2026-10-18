@@ -20,6 +20,7 @@ final class UsageViewModel: ObservableObject {
     @Published var switchingEmail: String? = nil         // 正在切换到的邮箱，nil=没有切换在进行
     @Published var switchMessage: String? = nil          // 切换结果提示（成功/失败都用这条），8 秒后自动清
     @Published var switchMessageIsError = false
+    @Published var acctQuotaVersion = 0                  // 每账号额度缓存变动计数：探测完成/recordQuota 后 +1，让账号卡重绘
 
     private let historyDays = 200
     private var watcher: FileWatcher?
@@ -29,6 +30,9 @@ final class UsageViewModel: ObservableObject {
     private var pendingRescan = false
     private var isFetchingPlan = false
     private var planTimer: Timer?
+    private let probeQueue = DispatchQueue(label: "com.jedee.pulse.probe", qos: .utility)
+    private var isProbing = false
+    private var lastProbeAt: Date? = nil
 
     init() {
         if let raw = UserDefaults.standard.string(forKey: "quotaSource"),
@@ -46,9 +50,11 @@ final class UsageViewModel: ObservableObject {
         // 套餐额度：启动拉一次，之后每 5 分钟一次
         fetchPlan()
         refreshAccounts()
+        probeAccounts()
         planTimer = Timer.scheduledTimer(withTimeInterval: 300, repeats: true) { [weak self] _ in
             self?.fetchPlan()
             self?.refreshAccounts()
+            self?.probeAccounts()
         }
     }
 
@@ -78,7 +84,10 @@ final class UsageViewModel: ObservableObject {
                 self.isFetchingPlan = false
                 if let r = r {
                     // 每账号额度缓存：不管当前展示的是不是这个来源，拿到 Claude 额度就记一笔
-                    if r.source == .claude { AccountSwitch.recordQuota(r) }
+                    if r.source == .claude {
+                        AccountSwitch.recordQuota(r)
+                        self.acctQuotaVersion += 1
+                    }
                     // 结果的来源要和当前选中的来源一致才赋值：防止切换瞬间旧请求回来覆盖新来源
                     guard r.source == self.quotaSource else { return }
                     self.plan = r
@@ -96,6 +105,30 @@ final class UsageViewModel: ObservableObject {
             guard let self = self, let status = status else { return }
             self.accounts = status.accounts
             self.activeOrg = status.active
+        }
+    }
+
+    /// 实时探测所有账号的额度（~/.claude/tokens/*.token，目录不存在则静默跳过）。
+    /// 防重入，且距上次探测不到 120 秒直接返回（节流，面板反复展开也不会狂发请求）。
+    func probeAccounts() {
+        guard !isProbing, TokenProbe.isAvailable else { return }
+        if let t = lastProbeAt, Date().timeIntervalSince(t) < 120 { return }
+        isProbing = true
+        lastProbeAt = Date()
+        probeQueue.async { [weak self] in
+            let results = TokenProbe.probeAll()
+            DispatchQueue.main.async {
+                guard let self = self else { return }
+                let now = Date()
+                for r in results {
+                    AccountSwitch.recordProbe(
+                        org: r.org, weeklyRemain: r.weeklyRemain, sessionRemain: r.sessionRemain,
+                        weeklyResetsAt: r.sevenDayReset, sessionResetsAt: r.fiveHourReset,
+                        limited: r.limited, fetchedAt: now)
+                }
+                self.isProbing = false
+                self.acctQuotaVersion += 1
+            }
         }
     }
 

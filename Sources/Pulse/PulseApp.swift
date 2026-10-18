@@ -24,6 +24,27 @@ struct Entry {
             } else {
                 print("PROBE codexPlan=nil")
             }
+            // 账号推荐：先实时探测各号额度写进缓存（共 N 个令牌 N 次请求），再按推荐算法排序打印
+            let probed = TokenProbe.probeAll()
+            for p in probed {
+                AccountSwitch.recordProbe(org: p.org, weeklyRemain: p.weeklyRemain, sessionRemain: p.sessionRemain,
+                                          weeklyResetsAt: p.sevenDayReset, sessionResetsAt: p.fiveHourReset,
+                                          limited: p.limited, fetchedAt: Date())
+            }
+            let tf = DateFormatter()
+            tf.dateFormat = "MM-dd HH:mm"
+            func fmt(_ d: Date?) -> String { d.map { tf.string(from: $0) } ?? "-" }
+            if let st = AccountSwitch.fetchStatusBlocking() {
+                let recs = AccountSwitch.recommendationOrder(accounts: st.accounts, now: Date())
+                let items = recs.map { r in
+                    "\(r.acct.email)/rank=\(r.rank)/usable=\(r.usable)/weekly=\(r.hasCache ? "\(r.weeklyRemain)%" : "-")"
+                    + "/5h=\(r.hasCache ? "\(r.sessionRemain)%" : "-")/weeklyReset=\(fmt(r.weeklyResetsAt))"
+                }
+                print("PROBE probed=\(probed.count) tokens=\(TokenProbe.loadTokens().count)")
+                print("PROBE accounts=\(items.joined(separator: " | "))")
+            } else {
+                print("PROBE accounts=nil")
+            }
             return
         }
         // 单实例锁：已有 Pulse 在跑就直接退出，避免多实例叠加扫描吃 CPU
@@ -208,6 +229,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         vm.panelVisible = true
         vm.refresh()
         vm.refreshAccounts()
+        vm.probeAccounts()   // 受 120 秒节流约束
 
         // 先按内容算好最终尺寸（高度钳到屏幕可用范围内，超出走滚动）+ 定位
         let size = hosting.fittingSize
@@ -623,11 +645,14 @@ struct PulseMenuContent: View {
             .background(color.opacity(0.14), in: Capsule())
     }
 
-    /// Claude 账号切换卡：cswitch 不存在时整张不显示。每行左圆点(●在用/○不在用)，
-    /// 在用行底色比其他行深一档（明度区分，不靠色相），非在用行给「切到这个号」蓝色按钮。
+    /// Claude 账号切换卡：cswitch 不存在时整张不显示。顶部一句推荐语（现在该用哪个号），
+    /// 账号行按推荐顺序排：用同一个蓝色 accent 的深浅分三档（明度区分，不靠色相），
+    /// 同时每档带文字标签＋形状（①行左侧竖条），去掉颜色也读得懂。「在用」只靠实心圆点＋「在用」胶囊表示。
     @ViewBuilder
     private var accountCard: some View {
         if AccountSwitch.isAvailable {
+            let _ = vm.acctQuotaVersion   // 依赖它：探测/记录额度后卡片重绘
+            let recs = AccountSwitch.recommendationOrder(accounts: vm.accounts, now: Date())
             VStack(alignment: .leading, spacing: 7) {
                 cardTitle(L.t("CLAUDE ACCOUNT", "CLAUDE 账号"))
                 if vm.accounts.isEmpty {
@@ -635,9 +660,10 @@ struct PulseMenuContent: View {
                         .font(.system(size: 11, weight: .medium))
                         .foregroundStyle(.secondary)
                 } else {
+                    if recs.count >= 2 { recommendationHeader(recs) }
                     VStack(spacing: 6) {
-                        ForEach(vm.accounts) { acct in
-                            accountRow(acct)
+                        ForEach(recs, id: \.acct.id) { rec in
+                            accountRow(rec)
                         }
                     }
                     if vm.accounts.count < 2 {
@@ -663,39 +689,149 @@ struct PulseMenuContent: View {
         }
     }
 
+    /// 深橙：不可用/需注意的状态文字（蓝—橙色盲安全对）
+    private var tagOrange: Color { Color(red: 0.75, green: 0.40, blue: 0.05) }
+
+    /// 邮箱 @ 前面的部分
+    private func emailPrefix(_ email: String) -> String {
+        email.split(separator: "@", maxSplits: 1).first.map(String.init) ?? email
+    }
+
+    /// 恢复/重置时刻：今天只写 HH:mm，其余带日期
+    private func clockStr(_ d: Date) -> String {
+        Calendar.current.isDateInToday(d) ? Self.timeStr(d) : Self.resetDayStr(d)
+    }
+
+    /// 推荐语：现在该用哪个号（目标是三个号的周额度都用完不作废）
+    @ViewBuilder
+    private func recommendationHeader(_ recs: [AcctRecommendation]) -> some View {
+        if let top = recs.first, top.hasCache {
+            VStack(alignment: .leading, spacing: 2) {
+                if top.usable {
+                    let name = emailPrefix(top.acct.email)
+                    Text(top.acct.active
+                         ? L.t("Use now: \(name) (already in use)", "现在该用：\(name)（就是在用这个）")
+                         : L.t("Use now: \(name), tap \"Switch now\"", "现在该用：\(name)，点它的「切过去」"))
+                        .font(.system(size: 11, weight: .semibold))
+                        .foregroundStyle(.primary)
+                        .lineLimit(2)
+                        .fixedSize(horizontal: false, vertical: true)
+                    if let r = top.weeklyResetsAt {
+                        Text(L.t("Weekly resets \(Self.resetDayStr(r)), \(top.weeklyRemain)% left",
+                                  "周额度 \(Self.resetDayStr(r)) 清零，还剩 \(top.weeklyRemain)%"))
+                            .font(.system(size: 9, weight: .medium))
+                            .foregroundStyle(.secondary)
+                            .lineLimit(1)
+                    }
+                } else {
+                    let name = emailPrefix(top.acct.email)
+                    let n = recs.count
+                    let zhN = n == 2 ? "两个" : (n == 3 ? "三个" : "\(n) 个")
+                    let back = top.recoverAt.map { clockStr($0) }
+                    Text(back != nil
+                         ? L.t("All \(n) accounts are maxed out for now. \(name) is back \(back!)",
+                                "\(zhN)号都暂时用满，\(name) \(back!) 恢复")
+                         : L.t("All \(n) accounts are maxed out for now", "\(zhN)号都暂时用满"))
+                        .font(.system(size: 11, weight: .semibold))
+                        .foregroundStyle(.primary)
+                        .lineLimit(2)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+            }
+        } else {
+            Text(L.t("Collecting quota data…", "正在获取各号额度…"))
+                .font(.system(size: 10, weight: .medium))
+                .foregroundStyle(.secondary)
+        }
+    }
+
     private var warnOrange: Color { Color(red: 0.92, green: 0.53, blue: 0.10) }
 
-    /// 单个账号行：左圆点(实心=在用/空心=不在用)，中间邮箱+额度小字，右侧「在用」标签或切换按钮；
-    /// 下面通栏一行周额度重置时间（左：哪天几点重置，右：还有多久）
-    private func accountRow(_ acct: CSwitchAccount) -> some View {
-        VStack(alignment: .leading, spacing: 5) {
-            accountRowTop(acct)
-            weeklyResetLine(for: acct)
+    /// 单个账号行：底色按推荐档位分三档（① 蓝 0.30＋左侧 3pt 实色竖条 / ② 蓝 0.14 / 其余浅白），
+    /// 第二行档位文字标签，第三行额度小字，最后通栏一行周额度重置时间
+    private func accountRow(_ rec: AcctRecommendation) -> some View {
+        let isTop = rec.usable && rec.rank == 1
+        let bg: Color = isTop ? accent.opacity(0.30)
+            : (rec.usable && rec.rank == 2 ? accent.opacity(0.14) : Color.white.opacity(0.55))
+        let shape = RoundedRectangle(cornerRadius: 10, style: .continuous)
+        return VStack(alignment: .leading, spacing: 4) {
+            accountRowTop(rec)
+            tierTag(rec)
                 .padding(.leading, 16)   // 8 圆点 + 8 间距，和邮箱左边对齐
+            Text(quotaLine(for: rec))
+                .font(.system(size: 9, weight: .medium))
+                .foregroundStyle(.secondary.opacity(0.85))
+                .lineLimit(1)
+                .padding(.leading, 16)
+            weeklyResetLine(for: rec)
+                .padding(.leading, 16)
         }
         .padding(.horizontal, 8)
         .padding(.vertical, 7)
-        .frame(maxWidth: .infinity)
-        .background(acct.active ? accent.opacity(0.12) : Color.white.opacity(0.55),
-                    in: RoundedRectangle(cornerRadius: 10, style: .continuous))
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(bg, in: shape)
+        .overlay(alignment: .leading) {
+            if isTop { Rectangle().fill(accent).frame(width: 3) }   // 形状编码：① 行左侧竖条
+        }
+        .clipShape(shape)
     }
 
-    private func accountRowTop(_ acct: CSwitchAccount) -> some View {
-        HStack(spacing: 8) {
+    /// 档位文字标签：① 现在该用（实色胶囊）/ ② 下一个（浅色胶囊）/ ③ 后备 / 不可用（深橙＋暂停图标）
+    @ViewBuilder
+    private func tierTag(_ rec: AcctRecommendation) -> some View {
+        if !rec.hasCache {
+            EmptyView()
+        } else if rec.usable && rec.rank == 1 {
+            Text(L.t("① Use now", "① 现在该用"))
+                .font(.system(size: 9, weight: .bold))
+                .foregroundStyle(.white)
+                .lineLimit(1).fixedSize()
+                .padding(.horizontal, 7)
+                .frame(height: 16)
+                .background(accent, in: Capsule())
+        } else if rec.usable && rec.rank == 2 {
+            Text(L.t("② Next", "② 下一个"))
+                .font(.system(size: 9, weight: .bold))
+                .foregroundStyle(accent)
+                .lineLimit(1).fixedSize()
+                .padding(.horizontal, 7)
+                .frame(height: 16)
+                .background(accent.opacity(0.18), in: Capsule())
+        } else if rec.usable {
+            Text(L.t("③ Backup", "③ 后备"))
+                .font(.system(size: 9, weight: .bold))
+                .foregroundStyle(.secondary)
+                .lineLimit(1).fixedSize()
+                .frame(height: 16)
+        } else {
+            let text: String = {
+                if rec.weeklyExhausted { return L.t("Weekly quota used up", "周额度用完") }
+                if let t = rec.recoverAt { return L.t("5h full, back \(clockStr(t))", "5 小时满 \(clockStr(t)) 恢复") }
+                return L.t("5h quota full", "5 小时额度已满")
+            }()
+            HStack(spacing: 3) {
+                Image(systemName: "pause.circle")
+                    .font(.system(size: 9, weight: .bold))
+                Text(text)
+                    .font(.system(size: 9, weight: .bold))
+                    .lineLimit(1)
+            }
+            .foregroundStyle(tagOrange)
+            .frame(height: 16)
+        }
+    }
+
+    private func accountRowTop(_ rec: AcctRecommendation) -> some View {
+        let acct = rec.acct
+        return HStack(spacing: 8) {
             Image(systemName: acct.active ? "circle.fill" : "circle")
                 .font(.system(size: 8, weight: .semibold))
                 .foregroundStyle(acct.active ? accent : Color.secondary.opacity(0.55))
-            VStack(alignment: .leading, spacing: 2) {
-                Text(acct.email)
-                    .font(.system(size: 11, weight: .semibold))
-                    .foregroundStyle(.primary)
-                    .lineLimit(1)
-                    .truncationMode(.middle)
-                Text(quotaLine(for: acct))
-                    .font(.system(size: 9, weight: .medium))
-                    .foregroundStyle(.secondary.opacity(0.85))
-                    .lineLimit(1)
-            }
+            Text(acct.email)
+                .font(.system(size: 11, weight: .semibold))
+                .foregroundStyle(rec.usable && rec.rank <= 2 ? Color.primary : Color.secondary)
+                .lineLimit(1)
+                .truncationMode(.middle)
             Spacer(minLength: 6)
             if acct.active {
                 Text(L.t("In use", "在用"))
@@ -705,28 +841,22 @@ struct PulseMenuContent: View {
                     .frame(height: 17)
                     .background(accent.opacity(0.18), in: Capsule())
             } else {
-                switchButton(acct)
+                switchButton(acct, isTop: rec.usable && rec.rank == 1)
             }
         }
     }
 
-    /// 周额度重置行。三种状态：还没到点（时间＋倒计时）/ 已过点（不在用的号缓存的时刻过期了，
-    /// 说明周额度已经刷新）/ 没记录。24 小时内重置的倒计时加粗变主色，靠粗细也能看出来。
-    private func weeklyResetLine(for acct: CSwitchAccount) -> some View {
-        let resetsAt = AccountSwitch.cachedQuota(for: acct.org)?.weeklyResetsAt
+    /// 周额度重置行：用有效周重置时间（已过点的按 +7 天滚到下一次），没记录才显示「还没记录」。
+    /// 24 小时内重置的倒计时加粗变主色，靠粗细也能看出来。
+    private func weeklyResetLine(for rec: AcctRecommendation) -> some View {
         let now = Date()
         let left: String
         var right: String? = nil
         var soon = false
-        if let r = resetsAt {
-            let day = Self.resetDayStr(r)
-            if r > now {
-                left = L.t("Weekly resets \(day)", "周额度 \(day) 重置")
-                right = Self.untilStr(r.timeIntervalSince(now))
-                soon = r.timeIntervalSince(now) < 24 * 3600
-            } else {
-                left = L.t("Weekly quota reset (\(day))", "周额度已重置（\(day)）")
-            }
+        if let r = rec.weeklyResetsAt {
+            left = L.t("Weekly resets \(Self.resetDayStr(r))", "周额度 \(Self.resetDayStr(r)) 重置")
+            right = Self.untilStr(r.timeIntervalSince(now))
+            soon = r.timeIntervalSince(now) < 24 * 3600
         } else {
             left = L.t("Weekly reset time not recorded", "周重置时间还没记录")
         }
@@ -771,11 +901,12 @@ struct PulseMenuContent: View {
         return L.t("in \(m)m", "\(m) 分钟后")
     }
 
-    private func switchButton(_ acct: CSwitchAccount) -> some View {
+    private func switchButton(_ acct: CSwitchAccount, isTop: Bool) -> some View {
         let isSwitchingThis = vm.switchingEmail == acct.email
         let anySwitching = vm.switchingEmail != nil
+        let label = isTop ? L.t("Switch now", "切过去") : L.t("Switch", "切到这个号")
         return Button(action: { vm.switchAccount(to: acct.email) }) {
-            Text(isSwitchingThis ? L.t("Switching…", "切换中…") : L.t("Switch", "切到这个号"))
+            Text(isSwitchingThis ? L.t("Switching…", "切换中…") : label)
                 .font(.system(size: 10, weight: .semibold))
                 .foregroundStyle(.white)
                 .lineLimit(1)
@@ -788,17 +919,18 @@ struct PulseMenuContent: View {
         .disabled(anySwitching)
     }
 
-    /// 额度小字：在用账号显示实时的「周剩%·5小时剩%」，其余账号显示上次看到的缓存值
-    private func quotaLine(for acct: CSwitchAccount) -> String {
-        guard let c = AccountSwitch.cachedQuota(for: acct.org) else {
+    /// 额度小字：有缓存一律「周剩 X% · 5 小时剩 Y%」（现在各号都有实时探测）；
+    /// 数据超过 15 分钟没更新的末尾加「（HH:mm）」。数值是按重置时间折算后的有效值。
+    private func quotaLine(for rec: AcctRecommendation) -> String {
+        guard rec.hasCache else {
             return L.t("No quota record yet", "还没有额度记录")
         }
-        if acct.active {
-            return L.t("Weekly \(c.weeklyRemain)% · 5h \(c.sessionRemain)% left",
-                        "周剩 \(c.weeklyRemain)% · 5 小时剩 \(c.sessionRemain)%")
+        var s = L.t("Weekly \(rec.weeklyRemain)% · 5h \(rec.sessionRemain)% left",
+                     "周剩 \(rec.weeklyRemain)% · 5 小时剩 \(rec.sessionRemain)%")
+        if let t = rec.fetchedAt, Date().timeIntervalSince(t) > 15 * 60 {
+            s += L.t(" (\(Self.timeStr(t)))", "（\(Self.timeStr(t))）")
         }
-        return L.t("Last seen: weekly \(c.weeklyRemain)% (\(Self.timeStr(c.fetchedAt)))",
-                    "上次剩 周 \(c.weeklyRemain)%（\(Self.timeStr(c.fetchedAt))）")
+        return s
     }
 
     /// 套餐额度卡：标题随来源变（CLAUDE PLAN / CODEX PLAN），右上角来源切换胶囊；
