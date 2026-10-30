@@ -697,6 +697,13 @@ struct PulseMenuContent: View {
         email.split(separator: "@", maxSplits: 1).first.map(String.init) ?? email
     }
 
+    /// 推荐语里的账号名：有代号写「A号 alice」，没有就只写邮箱前缀
+    private func acctName(_ acct: CSwitchAccount) -> String {
+        let prefix = emailPrefix(acct.email)
+        guard let label = TokenProbe.label(for: acct.org) else { return prefix }
+        return L.t("\(label) \(prefix)", "\(label)号 \(prefix)")
+    }
+
     /// 恢复/重置时刻：今天只写 HH:mm，其余带日期
     private func clockStr(_ d: Date) -> String {
         Calendar.current.isDateInToday(d) ? Self.timeStr(d) : Self.resetDayStr(d)
@@ -708,7 +715,7 @@ struct PulseMenuContent: View {
         if let top = recs.first, top.hasCache {
             VStack(alignment: .leading, spacing: 2) {
                 if top.usable {
-                    let name = emailPrefix(top.acct.email)
+                    let name = acctName(top.acct)
                     Text(top.acct.active
                          ? L.t("Use now: \(name) (already in use)", "现在该用：\(name)（就是在用这个）")
                          : L.t("Use now: \(name), tap \"Switch now\"", "现在该用：\(name)，点它的「切过去」"))
@@ -724,7 +731,7 @@ struct PulseMenuContent: View {
                             .lineLimit(1)
                     }
                 } else {
-                    let name = emailPrefix(top.acct.email)
+                    let name = acctName(top.acct)
                     let n = recs.count
                     let zhN = n == 2 ? "两个" : (n == 3 ? "三个" : "\(n) 个")
                     let back = top.recoverAt.map { clockStr($0) }
@@ -764,6 +771,8 @@ struct PulseMenuContent: View {
                 .lineLimit(1)
                 .padding(.leading, 16)
             weeklyResetLine(for: rec)
+                .padding(.leading, 16)
+            renewalLine(for: rec)
                 .padding(.leading, 16)
         }
         .padding(.horizontal, 8)
@@ -827,6 +836,16 @@ struct PulseMenuContent: View {
             Image(systemName: acct.active ? "circle.fill" : "circle")
                 .font(.system(size: 8, weight: .semibold))
                 .foregroundStyle(acct.active ? accent : Color.secondary.opacity(0.55))
+            if let label = TokenProbe.label(for: acct.org) {
+                // 账号代号：深色实底白字，靠明度跟邮箱区分
+                Text(L.t(label, "\(label)号"))
+                    .font(.system(size: 10, weight: .heavy))
+                    .foregroundStyle(.white)
+                    .lineLimit(1).fixedSize()
+                    .padding(.horizontal, 6)
+                    .frame(height: 17)
+                    .background(Color.primary.opacity(0.75), in: RoundedRectangle(cornerRadius: 4, style: .continuous))
+            }
             Text(acct.email)
                 .font(.system(size: 11, weight: .semibold))
                 .foregroundStyle(rec.usable && rec.rank <= 2 ? Color.primary : Color.secondary)
@@ -877,6 +896,44 @@ struct PulseMenuContent: View {
             }
         }
         .foregroundStyle(.secondary.opacity(0.85))
+    }
+
+    /// 订阅到期行：没在 renewals.json 里记录的号不显示。3 天内到期换成三角感叹号＋加粗深橙，
+    /// 靠图标和粗细区分，不靠颜色。
+    @ViewBuilder
+    private func renewalLine(for rec: AcctRecommendation) -> some View {
+        if let r = TokenProbe.renewal(for: rec.acct.org) {
+            let left = r.due.timeIntervalSince(Date())
+            let soon = left < 3 * 24 * 3600
+            let f: DateFormatter = {
+                let f = DateFormatter()
+                f.dateFormat = r.hasTime ? "M月d日 HH:mm" : "M月d日"
+                if !L.isZh { f.dateFormat = r.hasTime ? "MMM d, HH:mm" : "MMM d"; f.locale = Locale(identifier: "en_US") }
+                return f
+            }()
+            let dayLeft: String = {
+                // 超过一天只报天数，给左边的日期时间留位置
+                if r.hasTime, left < 24 * 3600 { return Self.untilStr(left) }
+                if r.hasTime { return L.t("in \(Int(left / 86400))d", "\(Int(left / 86400)) 天后") }
+                let days = Calendar.current.dateComponents([.day], from: Calendar.current.startOfDay(for: Date()),
+                                                           to: Calendar.current.startOfDay(for: r.due)).day ?? 0
+                return days <= 0 ? L.t("today", "今天") : L.t("in \(days)d", "\(days) 天后")
+            }()
+            HStack(spacing: 4) {
+                Image(systemName: soon ? "exclamationmark.triangle.fill" : "calendar")
+                    .font(.system(size: 8, weight: .semibold))
+                Text(L.t("Plan ends \(f.string(from: r.due))", "订阅到期 \(f.string(from: r.due))"))
+                    .font(.system(size: 9, weight: soon ? .bold : .medium))
+                    .lineLimit(1)
+                Spacer(minLength: 4)
+                Text(dayLeft)
+                    .font(.system(size: 9, weight: soon ? .bold : .medium))
+                    .monospacedDigit()
+                    .lineLimit(1)
+                    .fixedSize()
+            }
+            .foregroundStyle(soon ? tagOrange : Color.secondary.opacity(0.85))
+        }
     }
 
     /// 重置是哪天几点：今天/明天直说，其余「周X HH:mm」

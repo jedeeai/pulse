@@ -25,7 +25,7 @@ A macOS menu bar app that shows your Claude Code and Codex usage at a glance: to
 - **Event-driven, not polling** — after an initial one-time scan, an FSEvents watcher picks up new sessions incrementally. CPU usage is 0% while idle.
 - **Follows your system language** — Chinese system shows Chinese labels and 亿/万 units; anything else shows English and B/M/K units.
 - **Colorblind-safe** — status is never conveyed by red vs. green alone; every state has a text label, and the only accent colors used are blue and orange.
-- **Optional: switch between Claude accounts** — if you use more than one Claude account, install the bundled `cswitch` helper and an extra card lists your accounts, each one's last-seen quota and weekly reset time, with a one-click switch. See [Multiple Claude accounts](#multiple-claude-accounts-optional).
+- **Optional: switch between Claude accounts** — if you use more than one Claude account, install the bundled `cswitch` helper and an extra card lists your accounts, each one's quota and weekly reset time, with a one-click switch. Add a token per account and it also shows live quota for all of them and tells you which one to use next. See [Multiple Claude accounts](#multiple-claude-accounts-optional).
 - Single-instance (a second launch quits immediately), quit from the "Quit" button at the bottom of the panel.
 
 ## Install
@@ -88,12 +88,42 @@ How it works: Claude Code keeps its login in the Keychain item `Claude Code-cred
 
 To uninstall, delete `~/.local/bin/cswitch` (the card disappears), and optionally remove the saved logins in Keychain Access by searching for `cswitch-account`.
 
+### Live quota for every account (optional)
+
+By default, an account you're not using only shows the last quota Pulse saw while it was active. If you want live numbers for every account, plus a **Use now** pick, give Pulse a long-lived token per account:
+
+1. For each account, run `claude setup-token` in Terminal while logged in to that account in your browser. It prints a token starting with `sk-ant-oat01-`.
+2. Save each token as its own file in `~/.claude/tokens/`, named by a letter: `a.token`, `b.token`, `c.token`… Lock the folder down:
+
+   ```bash
+   mkdir -p ~/.claude/tokens && chmod 700 ~/.claude/tokens
+   # paste the token into ~/.claude/tokens/a.token, then:
+   chmod 600 ~/.claude/tokens/*.token
+   ```
+
+With tokens in place, Pulse checks every account on launch, every 5 minutes and when you open the panel (at most once every 2 minutes), and the card then:
+
+- shows live weekly and 5-hour quota for **every** account, not just the active one;
+- tags each account with its letter (**A**, **B**, **C**…, from the file name);
+- ranks the accounts and puts a **Use now** line on top: accounts with quota left go first, ordered by whose weekly quota resets soonest, so the quota that's about to expire gets used before it's lost. Accounts that are out of quota go last, with the time they come back.
+
+**Optional: renewal dates.** Create `~/.claude/tokens/renewals.json` with the date (and time, if you know it) you paid for each monthly plan, keyed by the same letters:
+
+```json
+{"A": "2026-10-28", "B": "2026-09-29 04:02"}
+```
+
+Each account row then shows when the plan next renews; Pulse rolls the date forward month by month, so you only edit it if you cancel and buy again. Within 3 days of renewal the line switches to a warning icon and bold text.
+
+No `tokens` folder means none of this shows up, and the card works as described above.
+
 ## Privacy
 
 - **Reads**: your local `~/.claude` and `~/.codex` session files (never modified), and the Claude Code OAuth `accessToken` from your Keychain.
 - **Never reads or touches**: your Claude Code `refreshToken` — Pulse itself only ever reads the short-lived `accessToken` and never writes to the Keychain or your credential files.
 - **Exception, only if you install `cswitch`**: switching accounts does write to the Keychain and `~/.claude.json`, because that's what switching means. `cswitch` stores each account's full login (including its `refreshToken`) in your local Keychain and never sends it anywhere. Without `cswitch` installed, none of this happens.
 - **Sends**: exactly one kind of network request — to Anthropic's own usage endpoint, using your own already-issued token, to read your remaining quota. That's it.
+- **Exception, only if you add `~/.claude/tokens/`**: Pulse also sends each account a tiny request to Anthropic's own Messages API (Claude Haiku, 1 output token) and reads the quota from the response headers. Each check uses a negligible slice of that account's quota. The tokens stay on your Mac.
 - **Never sends**: source code, prompts, conversation content, file contents, or any analytics/telemetry. Pulse has no backend of its own.
 - **Fully offline mode**: switch the plan quota card to Codex and Pulse makes zero network requests, since Codex quota is read from local files only.
 
